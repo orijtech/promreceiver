@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	gokitLog "github.com/go-kit/kit/log"
@@ -48,7 +49,7 @@ func newCustomAppender(ms MetricsSink) *customAppender {
 		metricsSink: ms,
 		metricsProcessor: &metricsProcessor{
 			definitionsByMetricName: make(map[string][]*bucketDefinition),
-			lastSeenBucketData:      make(map[string]*lastSeenBucketData),
+			lastSeenData:            make(map[string]*lastSeenData),
 		},
 	}
 }
@@ -200,16 +201,21 @@ func (ca *customAppender) parseMetadata(labelsList labels.Labels) (string, *scra
 
 var (
 	errNoMetadata = errors.New("no metadata was parsed")
+	errStaleData  = errors.New("encountered stale data since last scrape")
 	errNilMetric  = errors.New("expected a non-nil Metric")
 )
 
 type metricsProcessor struct {
+	mu sync.RWMutex
+
 	definitionsByMetricName map[string][]*bucketDefinition
-	lastSeenBucketData      map[string]*lastSeenBucketData
+	lastSeenData            map[string]*lastSeenData
 }
 
-type lastSeenBucketData struct {
+type lastSeenData struct {
 	lastSeenSum          float64
+	lastSeenValue        float64
+	lastSeenCount        float64
 	lastSeenBucketCounts []float64
 
 	// These times below are useful
@@ -218,7 +224,10 @@ type lastSeenBucketData struct {
 }
 
 func (mp *metricsProcessor) lastSeenSum(key string) (sum float64) {
-	lsbd := mp.lastSeenBucketData[key]
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+
+	lsbd := mp.lastSeenData[key]
 	if lsbd != nil {
 		sum = lsbd.lastSeenSum
 	}
@@ -226,17 +235,45 @@ func (mp *metricsProcessor) lastSeenSum(key string) (sum float64) {
 }
 
 func (mp *metricsProcessor) lastSeenBucketCounts(key string) (bucketCounts []float64) {
-	lsbd := mp.lastSeenBucketData[key]
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+
+	lsbd := mp.lastSeenData[key]
 	if lsbd != nil {
 		bucketCounts = lsbd.lastSeenBucketCounts
 	}
 	return
 }
 
-func (mp *metricsProcessor) withNonNilAndToBeSavedBucketData(key string, useIt func(*lastSeenBucketData)) {
-	lsbd, ok := mp.lastSeenBucketData[key]
+func (mp *metricsProcessor) lastSeenCount(key string) (count float64) {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+
+	lsbd := mp.lastSeenData[key]
+	if lsbd != nil {
+		count = lsbd.lastSeenCount
+	}
+	return
+}
+
+func (mp *metricsProcessor) lastSeenValue(key string) (value float64) {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+
+	lsbd := mp.lastSeenData[key]
+	if lsbd != nil {
+		value = lsbd.lastSeenValue
+	}
+	return
+}
+
+func (mp *metricsProcessor) withNonNilAndToBeSavedBucketData(key string, useIt func(*lastSeenData)) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	lsbd, ok := mp.lastSeenData[key]
 	if !ok || lsbd == nil {
-		lsbd = new(lastSeenBucketData)
+		lsbd = new(lastSeenData)
 	}
 	useIt(lsbd)
 
@@ -244,25 +281,40 @@ func (mp *metricsProcessor) withNonNilAndToBeSavedBucketData(key string, useIt f
 	// with eviction of least recently used items.
 	lsbd.lastTouchTime = time.Now().UTC()
 
-	mp.lastSeenBucketData[key] = lsbd
+	mp.lastSeenData[key] = lsbd
 }
 
 func (mp *metricsProcessor) clearLastSeenBucketCounts(key string) {
-	lsbd, ok := mp.lastSeenBucketData[key]
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	lsbd, ok := mp.lastSeenData[key]
 	if ok && lsbd != nil {
 		lsbd.lastSeenBucketCounts = lsbd.lastSeenBucketCounts[:0]
 	}
 }
 
 func (mp *metricsProcessor) setLastSeenSum(key string, newSum float64) {
-	mp.withNonNilAndToBeSavedBucketData(key, func(lsbd *lastSeenBucketData) {
+	mp.withNonNilAndToBeSavedBucketData(key, func(lsbd *lastSeenData) {
 		lsbd.lastSeenSum = newSum
 	})
 }
 
 func (mp *metricsProcessor) setLastSeenBucketCounts(key string, newBucketCounts []float64) {
-	mp.withNonNilAndToBeSavedBucketData(key, func(lsbd *lastSeenBucketData) {
+	mp.withNonNilAndToBeSavedBucketData(key, func(lsbd *lastSeenData) {
 		lsbd.lastSeenBucketCounts = newBucketCounts
+	})
+}
+
+func (mp *metricsProcessor) setLastSeenCount(key string, newCount float64) {
+	mp.withNonNilAndToBeSavedBucketData(key, func(lsbd *lastSeenData) {
+		lsbd.lastSeenCount = newCount
+	})
+}
+
+func (mp *metricsProcessor) setLastSeenValue(key string, newValue float64) {
+	mp.withNonNilAndToBeSavedBucketData(key, func(lsbd *lastSeenData) {
+		lsbd.lastSeenValue = newValue
 	})
 }
 
@@ -279,10 +331,10 @@ func (ca *customAppender) processHistogramLikeMetrics(metricName string, metadat
 		return err
 	}
 
-	mp := ca.metricsProcessor
-	key := bdef.metricName
+	key := hash(bdef.metricName, bdef.orderedTags)
 
 	// Get the stored stack first.
+	mp := ca.metricsProcessor
 	stack := mp.definitionsByMetricName[key]
 
 	// Before processing a metric, we have to have all 3 markers:
@@ -460,12 +512,7 @@ func (ca *customAppender) processHistogramLikeMetrics(metricName string, metadat
 
 	// TODO(@odeke-em): For consistency, ensure that all the discrete
 	// parts of a distribution share the exact same timestamp.
-	timeAtMs = infBucket.timeAtMs
-	secs, ns := timeAtMs/1e3, (timeAtMs%1e3)*1e6
-	startTimestamp := &timestamp.Timestamp{
-		Seconds: secs,
-		Nanos:   int32(ns),
-	}
+	startTimestamp := timestampFromMs(infBucket.timeAtMs)
 
 	dv := &metricspb.DistributionValue{
 		Buckets:               protoBuckets,
@@ -481,17 +528,7 @@ func (ca *customAppender) processHistogramLikeMetrics(metricName string, metadat
 		},
 	}
 
-	var labelKeys []*metricspb.LabelKey
-	var labelValues []*metricspb.LabelValue
-	if len(infBucket.orderedTags) > 0 {
-		labelKeys = make([]*metricspb.LabelKey, len(infBucket.orderedTags))
-		labelValues = make([]*metricspb.LabelValue, len(infBucket.orderedTags))
-		for i, tag := range infBucket.orderedTags {
-			labelKeys[i] = &metricspb.LabelKey{Key: tag.Name}
-			labelValues[i] = &metricspb.LabelValue{Value: tag.Value}
-		}
-	}
-
+	labelKeys, labelValues := orderedTagsToLabelKeysLabelValues(infBucket.orderedTags)
 	ts := []*metricspb.TimeSeries{
 		{
 			LabelValues:    labelValues,
@@ -689,6 +726,9 @@ func (ca *customAppender) processNonHistogramLikeMetrics(metricName string, meta
 		case labels.AlertName:
 			// Do nothing.
 
+		case labels.MetricName:
+			// Do nothing.
+
 		default:
 			orderedTags = append(orderedTags, label)
 		}
@@ -708,56 +748,79 @@ func (ca *customAppender) processNonHistogramLikeMetrics(metricName string, meta
 	// And now it is conversion time.
 
 	metric := new(metricspb.Metric)
-	secs, ns := timeAtMs/1e3, (timeAtMs%1e3)*1e6
 	point := &metricspb.Point{
-		Timestamp: &timestamp.Timestamp{
-			Seconds: secs,
-			Nanos:   int32(ns),
-		},
+		Timestamp: timestampFromMs(timeAtMs),
 	}
+
+	labelKeys, labelValues := orderedTagsToLabelKeysLabelValues(orderedTags)
 
 	switch metadataType := string(metadata.Type); strings.ToLower(metadataType) {
 	case "counter":
+		mp := ca.metricsProcessor
+		key := hash(metricName, orderedTags)
+		lastSeenCount := mp.lastSeenCount(key)
+		// Memoize the current value as the last seen count.
+		mp.setLastSeenCount(key, value)
+
+		// Now compute the discrete count since
+		// Prometheus data is cumulatively stored.
+		discreteCount := value - lastSeenCount
+		if discreteCount < 0 {
+			// This is stale data that we are dealing with.
+			// We need to discard it.
+			return errStaleData
+		}
+
 		metric.Descriptor_ = &metricspb.Metric_MetricDescriptor{
 			MetricDescriptor: &metricspb.MetricDescriptor{
 				Name:        metricName,
 				Unit:        metadata.Unit,
 				Description: metadata.Help,
-				Type:        metricspb.MetricDescriptor_CUMULATIVE_DOUBLE,
+				Type:        metricspb.MetricDescriptor_CUMULATIVE_INT64,
+				LabelKeys:   labelKeys,
 			},
 		}
-		point.Value = &metricspb.Point_DoubleValue{
-			DoubleValue: value,
+		point.Value = &metricspb.Point_Int64Value{
+			Int64Value: int64(math.Round(discreteCount)),
 		}
 
 	case "gauge":
+		mp := ca.metricsProcessor
+		key := hash(metricName, orderedTags)
+		lastSeenValue := mp.lastSeenValue(key)
+		// Memoize the current value as the last seen count.
+		mp.setLastSeenValue(key, value)
+
+		// Now compute the discrete value since
+		// Prometheus data is cumulatively stored.
+		discreteValue := value - lastSeenValue
+		if discreteValue < 0 {
+			// This is stale data that we are dealing with.
+			// We need to discard it.
+			return errStaleData
+		}
+
 		metric.Descriptor_ = &metricspb.Metric_MetricDescriptor{
 			MetricDescriptor: &metricspb.MetricDescriptor{
 				Name:        metricName,
 				Unit:        metadata.Unit,
 				Description: metadata.Help,
 				Type:        metricspb.MetricDescriptor_GAUGE_DOUBLE,
+				LabelKeys:   labelKeys,
 			},
 		}
 		point.Value = &metricspb.Point_DoubleValue{
-			DoubleValue: value,
+			DoubleValue: discreteValue,
 		}
 
-	case "summary":
-		metric.Descriptor_ = &metricspb.Metric_MetricDescriptor{
-			MetricDescriptor: &metricspb.MetricDescriptor{
-				Name:        metricName,
-				Unit:        metadata.Unit,
-				Description: metadata.Help,
-				Type:        metricspb.MetricDescriptor_SUMMARY,
-			},
-		}
+	default:
+		return fmt.Errorf("unknown metric type: %s", metadataType)
 	}
 
 	metric.Timeseries = []*metricspb.TimeSeries{
 		{
 			StartTimestamp: point.Timestamp,
-			LabelValues:    []*metricspb.LabelValue{},
+			LabelValues:    labelValues,
 			Points:         []*metricspb.Point{point},
 		},
 	}
@@ -797,19 +860,6 @@ func nodeFromJobNameAddress(jobName, address, scheme string) *commonpb.Node {
 		},
 	}
 	return node
-}
-
-func tagsToLabelKeys(tagsOrder map[string]int, tags map[string]string) []*metricspb.LabelValue {
-	labelValues := make([]*metricspb.LabelValue, len(tagsOrder))
-	for tagKey, tagValue := range tags {
-		index, ok := tagsOrder[tagKey]
-		if ok {
-			labelValues[index] = &metricspb.LabelValue{
-				Value: tagValue,
-			}
-		}
-	}
-	return labelValues
 }
 
 func heuristicalMetricAndKnownUnits(metricName string) (metricName_, unit string) {
@@ -862,4 +912,32 @@ func hostPort(addr string) (host, port string) {
 		host, port = addr[:index], addr[index+1:]
 	}
 	return
+}
+
+func hash(metricName string, orderedTags labels.Labels) string {
+	return fmt.Sprintf("%s-%d", metricName, orderedTags.Hash())
+}
+
+func orderedTagsToLabelKeysLabelValues(orderedTags labels.Labels) (labelKeys []*metricspb.LabelKey, labelValues []*metricspb.LabelValue) {
+	if len(orderedTags) == 0 {
+		return
+	}
+
+	labelKeys = make([]*metricspb.LabelKey, len(orderedTags))
+	labelValues = make([]*metricspb.LabelValue, len(orderedTags))
+	for i, tag := range orderedTags {
+		labelKeys[i] = &metricspb.LabelKey{Key: tag.Name}
+		labelValues[i] = &metricspb.LabelValue{Value: tag.Value}
+	}
+
+	return
+}
+
+func timestampFromMs(timeAtMs int64) *timestamp.Timestamp {
+	secs, ns := timeAtMs/1e3, (timeAtMs%1e3)*1e6
+	return &timestamp.Timestamp{
+		Seconds: secs,
+		Nanos:   int32(ns),
+	}
+
 }
