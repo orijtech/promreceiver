@@ -71,6 +71,10 @@ func newCustomAppender(ms MetricsSink, opts ...Option) *customAppender {
 	}
 	ca.allMetricsBundler = allMetricsBundler
 
+	if ca.logger == nil {
+		ca.logger = gokitLog.NewNopLogger()
+	}
+
 	return ca
 }
 
@@ -99,14 +103,14 @@ func (r *Receiver) Cancel() error {
 	return err
 }
 
-func ReceiverFromConfig(ctx context.Context, ms MetricsSink, cfg *config.Config, logger gokitLog.Logger, opts ...Option) (*Receiver, error) {
-	capp := newCustomAppender(ms)
-	scrapeManager := scrape.NewManager(logger, capp)
+func ReceiverFromConfig(ctx context.Context, ms MetricsSink, cfg *config.Config, opts ...Option) (*Receiver, error) {
+	capp := newCustomAppender(ms, opts...)
+	scrapeManager := scrape.NewManager(capp.logger, capp)
 	capp.scrapeManager = scrapeManager
 
 	ctxScrape, cancelScrape := context.WithCancel(ctx)
 
-	discoveryManagerScrape := discovery.NewManager(ctxScrape, logger)
+	discoveryManagerScrape := discovery.NewManager(ctxScrape, capp.logger)
 	go discoveryManagerScrape.Run()
 	scrapeManager.ApplyConfig(cfg)
 
@@ -145,6 +149,7 @@ func ReceiverFromConfig(ctx context.Context, ms MetricsSink, cfg *config.Config,
 
 type customAppender struct {
 	allMetricsBundler   *bundler.Bundler
+	logger              gokitLog.Logger
 	metricsBufferPeriod time.Duration
 	metricsBufferCount  int
 	scrapeManager       *scrape.Manager

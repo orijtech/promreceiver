@@ -16,6 +16,8 @@ package promreceiver
 
 import (
 	"time"
+
+	gokitLog "github.com/go-kit/kit/log"
 )
 
 type Option interface {
@@ -46,4 +48,19 @@ var _ Option = (*withBufferCount)(nil)
 func WithBufferCount(count int) Option {
 	wbc := withBufferCount(count)
 	return &wbc
+}
+
+type withLogger struct {
+	logger gokitLog.Logger
+}
+
+func (wl *withLogger) withCustomAppender(ca *customAppender) {
+	ca.logger = wl.logger
+}
+
+var _ Option = (*withLogger)(nil)
+
+func WithLogger(lgr gokitLog.Logger) Option {
+	wl := withLogger{logger: lgr}
+	return &wl
 }

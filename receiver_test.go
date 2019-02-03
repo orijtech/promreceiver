@@ -27,7 +27,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	gokitLog "github.com/go-kit/kit/log"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/textparse"
@@ -72,13 +71,12 @@ scrape_configs:
       - targets: ['%s']`, ux.Host)
 
 	ma := new(metricsAppender)
-	nopLogger := gokitLog.NewNopLogger()
 	cfg, err := config.Load(rawConfig)
 	if err != nil {
 		t.Fatalf("Failed to load the Prometheus configuration: %v", err)
 	}
 
-	recv, _ := ReceiverFromConfig(context.Background(), ma, cfg, nopLogger)
+	recv, _ := ReceiverFromConfig(context.Background(), ma, cfg)
 	defer recv.Cancel()
 
 	// Wait until all the requests are sent.

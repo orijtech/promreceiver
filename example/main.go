@@ -22,7 +22,6 @@ import (
 	"os/signal"
 	"time"
 
-	gokitLog "github.com/go-kit/kit/log"
 	"github.com/prometheus/prometheus/config"
 
 	"github.com/orijtech/promreceiver"
@@ -49,11 +48,10 @@ scrape_configs:
 	if err != nil {
 		log.Fatalf("Failed to load the Prometheus YAML configuration: %v", err)
 	}
-	nopLogger := gokitLog.NewNopLogger()
 
 	jems := new(jsonEncodingMetricsSink)
 
-	recv, _ := promreceiver.ReceiverFromConfig(context.Background(), jems, cfg, nopLogger, promreceiver.WithBufferPeriod(5*time.Second))
+	recv, _ := promreceiver.ReceiverFromConfig(context.Background(), jems, cfg, promreceiver.WithBufferPeriod(5*time.Second))
 	defer recv.Cancel()
 
 	shutdownCh := make(chan os.Signal, 1)
