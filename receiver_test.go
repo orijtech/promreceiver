@@ -16,6 +16,7 @@ package promreceiver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -77,14 +78,17 @@ scrape_configs:
 		t.Fatalf("Failed to load the Prometheus configuration: %v", err)
 	}
 
-	cancel, _ := ReceiverFromConfig(context.Background(), ma, cfg, nopLogger)
-	defer cancel()
+	recv, _ := ReceiverFromConfig(context.Background(), ma, cfg, nopLogger)
+	defer recv.Cancel()
 
 	// Wait until all the requests are sent.
 	<-done
 
+	recv.Flush()
+
 	ma.forEachExportMetricsServiceRequest(func(ereq *agentmetricspb.ExportMetricsServiceRequest) {
-		t.Logf("ereq: %+v\n", ereq)
+		blob, _ := json.MarshalIndent(ereq, "", "  ")
+		t.Logf("\n%s\n\n", blob)
 	})
 }
 
@@ -177,12 +181,21 @@ func TestProcessNonHistogramLikeMetrics(t *testing.T) {
 			t.Errorf("#%d: unexpected error: %v", i, err)
 			continue
 		}
+		ca.flush()
 
 		got := ma.clearAllExportMetricsServiceRequest()
 		if !reflect.DeepEqual(got, tt.want) {
-			t.Errorf("#%d:\nGot:  %+v\n\nWant: %+v\n", i, got, tt.want)
+			gb, wb := asJSON(got), asJSON(tt.want)
+			if gb != wb {
+				t.Errorf("#%d:\nGot:\n%s\n\nWant:\n%s\n\n", i, gb, wb)
+			}
 		}
 	}
+}
+
+func asJSON(v interface{}) string {
+	blob, _ := json.MarshalIndent(v, "", "  ")
+	return string(blob)
 }
 
 type metricsAppender struct {

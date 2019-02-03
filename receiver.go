@@ -38,23 +38,68 @@ import (
 	commonpb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/common/v1"
 	agentmetricspb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/metrics/v1"
 	metricspb "github.com/census-instrumentation/opencensus-proto/gen-go/metrics/v1"
+	"google.golang.org/api/support/bundler"
 )
 
 type MetricsSink interface {
 	ReceiveMetrics(context.Context, *agentmetricspb.ExportMetricsServiceRequest) error
 }
 
-func newCustomAppender(ms MetricsSink) *customAppender {
-	return &customAppender{
+func newCustomAppender(ms MetricsSink, opts ...Option) *customAppender {
+	ca := &customAppender{
 		metricsSink: ms,
 		metricsProcessor: &metricsProcessor{
 			definitionsByMetricName: make(map[string][]*bucketDefinition),
 			lastSeenData:            make(map[string]*lastSeenData),
 		},
 	}
+
+	for _, opt := range opts {
+		opt.withCustomAppender(ca)
+	}
+
+	allMetricsBundler := bundler.NewBundler((*bundling)(nil), func(data interface{}) {
+		bundlings := data.([]*bundling)
+		compactAndCombineMetrics(ms, bundlings)
+	})
+	allMetricsBundler.DelayThreshold = ca.metricsBufferPeriod
+	if allMetricsBundler.DelayThreshold <= 0 {
+		allMetricsBundler.DelayThreshold = 5 * time.Second // TODO: Make this configurable.
+	}
+	if allMetricsBundler.BundleCountThreshold <= 0 {
+		allMetricsBundler.BundleCountThreshold = 100 // TODO: Make this configurable.
+	}
+	ca.allMetricsBundler = allMetricsBundler
+
+	return ca
 }
 
-func ReceiverFromConfig(ctx context.Context, ms MetricsSink, cfg *config.Config, logger gokitLog.Logger) (cancel func(), errsChan chan error) {
+type Receiver struct {
+	cancelOnce sync.Once
+	cancelFn   func()
+	flushFn    func()
+	errsChan   <-chan error
+}
+
+func (r *Receiver) Flush() {
+	r.flushFn()
+}
+
+func (r *Receiver) ErrsChan() <-chan error {
+	return r.errsChan
+}
+
+var errAlreadyCancelled = errors.New("already cancelled")
+
+func (r *Receiver) Cancel() error {
+	var err = errAlreadyCancelled
+	r.cancelOnce.Do(func() {
+		err = nil
+	})
+	return err
+}
+
+func ReceiverFromConfig(ctx context.Context, ms MetricsSink, cfg *config.Config, logger gokitLog.Logger, opts ...Option) (*Receiver, error) {
 	capp := newCustomAppender(ms)
 	scrapeManager := scrape.NewManager(logger, capp)
 	capp.scrapeManager = scrapeManager
@@ -67,7 +112,7 @@ func ReceiverFromConfig(ctx context.Context, ms MetricsSink, cfg *config.Config,
 
 	// Run the scrape manager.
 	syncConfig := make(chan bool)
-	errsChan = make(chan error, 1)
+	errsChan := make(chan error, 1)
 	go func() {
 		defer close(errsChan)
 
@@ -89,19 +134,32 @@ func ReceiverFromConfig(ctx context.Context, ms MetricsSink, cfg *config.Config,
 	// Now trigger the discovery notification to the scrape manager.
 	discoveryManagerScrape.ApplyConfig(discoveryCfg)
 
-	return cancelScrape, errsChan
+	rcv := &Receiver{
+		cancelFn: cancelScrape,
+		errsChan: errsChan,
+		flushFn:  capp.flush,
+	}
+
+	return rcv, nil
 }
 
 type customAppender struct {
-	scrapeManager    *scrape.Manager
-	metricsProcessor *metricsProcessor
-	metricsSink      MetricsSink
+	allMetricsBundler   *bundler.Bundler
+	metricsBufferPeriod time.Duration
+	metricsBufferCount  int
+	scrapeManager       *scrape.Manager
+	metricsProcessor    *metricsProcessor
+	metricsSink         MetricsSink
 }
 
 var _ scrape.Appendable = (*customAppender)(nil)
 
 func (ca *customAppender) Appender() (storage.Appender, error) {
 	return ca, nil
+}
+
+func (ca *customAppender) flush() {
+	ca.allMetricsBundler.Flush()
 }
 
 func (ca *customAppender) Commit() error   { return nil }
@@ -529,44 +587,35 @@ func (ca *customAppender) processHistogramLikeMetrics(metricName string, metadat
 	}
 
 	labelKeys, labelValues := orderedTagsToLabelKeysLabelValues(infBucket.orderedTags)
-	ts := []*metricspb.TimeSeries{
-		{
-			LabelValues:    labelValues,
-			StartTimestamp: startTimestamp,
-			Points: []*metricspb.Point{
-				{
-					Timestamp: startTimestamp,
-					Value: &metricspb.Point_DistributionValue{
-						DistributionValue: dv,
-					},
-				},
-			},
+	point := &metricspb.Point{
+		Timestamp: startTimestamp,
+		Value: &metricspb.Point_DistributionValue{
+			DistributionValue: dv,
 		},
 	}
 
 	md := &metricspb.MetricDescriptor{
-		Name:        key,
+		Name:        infBucket.metricName,
 		Description: infBucket.description,
 		Unit:        infBucket.unit,
 		Type:        infBucket.typ,
 		LabelKeys:   labelKeys,
 	}
 
-	metric := &metricspb.Metric{
-		Descriptor_: &metricspb.Metric_MetricDescriptor{
-			MetricDescriptor: md,
-		},
-		Timeseries: ts,
+	node := nodeFromJobNameAddress(infBucket.nodeName, infBucket.address, infBucket.scheme)
+
+	bdl := &bundling{
+		md:          md,
+		node:        node,
+		resource:    nil,
+		point:       point,
+		ts:          startTimestamp,
+		labelValues: labelValues,
 	}
 
-	ereq := &agentmetricspb.ExportMetricsServiceRequest{
-		Node: nodeFromJobNameAddress(infBucket.nodeName, infBucket.address, infBucket.scheme),
-		Metrics: []*metricspb.Metric{
-			metric,
-		},
-	}
+	ca.allMetricsBundler.Add(bdl, 1)
 
-	return ca.metricsSink.ReceiveMetrics(context.Background(), ereq)
+	return nil
 }
 
 type distributionMarker int
@@ -747,12 +796,13 @@ func (ca *customAppender) processNonHistogramLikeMetrics(metricName string, meta
 
 	// And now it is conversion time.
 
-	metric := new(metricspb.Metric)
+	atTimestamp := timestampFromMs(timeAtMs)
 	point := &metricspb.Point{
-		Timestamp: timestampFromMs(timeAtMs),
+		Timestamp: atTimestamp,
 	}
 
 	labelKeys, labelValues := orderedTagsToLabelKeysLabelValues(orderedTags)
+	var metricDescriptor *metricspb.MetricDescriptor
 
 	switch metadataType := string(metadata.Type); strings.ToLower(metadataType) {
 	case "counter":
@@ -771,14 +821,12 @@ func (ca *customAppender) processNonHistogramLikeMetrics(metricName string, meta
 			return errStaleData
 		}
 
-		metric.Descriptor_ = &metricspb.Metric_MetricDescriptor{
-			MetricDescriptor: &metricspb.MetricDescriptor{
-				Name:        metricName,
-				Unit:        metadata.Unit,
-				Description: metadata.Help,
-				Type:        metricspb.MetricDescriptor_CUMULATIVE_INT64,
-				LabelKeys:   labelKeys,
-			},
+		metricDescriptor = &metricspb.MetricDescriptor{
+			Name:        metricName,
+			Unit:        metadata.Unit,
+			Description: metadata.Help,
+			Type:        metricspb.MetricDescriptor_CUMULATIVE_INT64,
+			LabelKeys:   labelKeys,
 		}
 		point.Value = &metricspb.Point_Int64Value{
 			Int64Value: int64(math.Round(discreteCount)),
@@ -800,39 +848,33 @@ func (ca *customAppender) processNonHistogramLikeMetrics(metricName string, meta
 			return errStaleData
 		}
 
-		metric.Descriptor_ = &metricspb.Metric_MetricDescriptor{
-			MetricDescriptor: &metricspb.MetricDescriptor{
-				Name:        metricName,
-				Unit:        metadata.Unit,
-				Description: metadata.Help,
-				Type:        metricspb.MetricDescriptor_GAUGE_DOUBLE,
-				LabelKeys:   labelKeys,
-			},
+		metricDescriptor = &metricspb.MetricDescriptor{
+			Name:        metricName,
+			Unit:        metadata.Unit,
+			Description: metadata.Help,
+			Type:        metricspb.MetricDescriptor_GAUGE_DOUBLE,
+			LabelKeys:   labelKeys,
 		}
 		point.Value = &metricspb.Point_DoubleValue{
 			DoubleValue: discreteValue,
 		}
 
 	default:
-		return fmt.Errorf("unknown metric type: %s", metadataType)
+		return fmt.Errorf("unknown recognized metric type: %s", metadataType)
 	}
 
-	metric.Timeseries = []*metricspb.TimeSeries{
-		{
-			StartTimestamp: point.Timestamp,
-			LabelValues:    labelValues,
-			Points:         []*metricspb.Point{point},
-		},
+	node := nodeFromJobNameAddress(jobName, address, scheme)
+	bdl := &bundling{
+		md:          metricDescriptor,
+		node:        node,
+		resource:    nil,
+		point:       point,
+		ts:          atTimestamp,
+		labelValues: labelValues,
 	}
 
-	ereq := &agentmetricspb.ExportMetricsServiceRequest{
-		Node: nodeFromJobNameAddress(jobName, address, scheme),
-		Metrics: []*metricspb.Metric{
-			metric,
-		},
-	}
-
-	return ca.metricsSink.ReceiveMetrics(context.Background(), ereq)
+	ca.allMetricsBundler.Add(bdl, 1)
+	return nil
 }
 
 func nodeFromJobNameAddress(jobName, address, scheme string) *commonpb.Node {
@@ -939,5 +981,4 @@ func timestampFromMs(timeAtMs int64) *timestamp.Timestamp {
 		Seconds: secs,
 		Nanos:   int32(ns),
 	}
-
 }

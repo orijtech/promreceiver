@@ -20,6 +20,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"time"
 
 	gokitLog "github.com/go-kit/kit/log"
 	"github.com/prometheus/prometheus/config"
@@ -52,8 +53,8 @@ scrape_configs:
 
 	jems := new(jsonEncodingMetricsSink)
 
-	cancel, _ := promreceiver.ReceiverFromConfig(context.Background(), jems, cfg, nopLogger)
-	defer cancel()
+	recv, _ := promreceiver.ReceiverFromConfig(context.Background(), jems, cfg, nopLogger, promreceiver.WithBufferPeriod(5*time.Second))
+	defer recv.Cancel()
 
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, os.Interrupt)
