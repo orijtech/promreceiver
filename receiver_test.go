@@ -126,18 +126,16 @@ func TestProcessNonHistogramLikeMetrics(t *testing.T) {
 					Metrics: []*metricspb.Metric{
 						{
 
-							Descriptor_: &metricspb.Metric_MetricDescriptor{
-								MetricDescriptor: &metricspb.MetricDescriptor{
-									Name:        "call_counts",
-									Description: "The number of calls",
-									Unit:        "1",
-									Type:        metricspb.MetricDescriptor_CUMULATIVE_INT64,
-									LabelKeys: []*metricspb.LabelKey{
-										{Key: "client"},
-										{Key: "os"},
-										{Key: "method"},
-										{Key: "status"},
-									},
+							MetricDescriptor: &metricspb.MetricDescriptor{
+								Name:        "call_counts",
+								Description: "The number of calls",
+								Unit:        "1",
+								Type:        metricspb.MetricDescriptor_CUMULATIVE_INT64,
+								LabelKeys: []*metricspb.LabelKey{
+									{Key: "client"},
+									{Key: "os"},
+									{Key: "method"},
+									{Key: "status"},
 								},
 							},
 							Timeseries: []*metricspb.TimeSeries{

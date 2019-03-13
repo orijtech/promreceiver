@@ -141,10 +141,8 @@ func createMetricsWithSameMetricDescriptorNodeResource(bundlings []*bundling) (*
 
 	head := bundlings[0]
 	metric := &metricspb.Metric{
-		Descriptor_: &metricspb.Metric_MetricDescriptor{
-			MetricDescriptor: head.md,
-		},
-		Timeseries: timeseries,
+		MetricDescriptor: head.md,
+		Timeseries:       timeseries,
 	}
 
 	return head.node, head.resource, metric
