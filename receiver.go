@@ -865,7 +865,13 @@ func (ca *customAppender) processNonHistogramLikeMetrics(metricName string, meta
 		}
 
 	default:
-		return fmt.Errorf("unknown recognized metric type: %s", metadataType)
+		// Due to the number of unwieldy metric types in the wild
+		// that we might not know about, it is safer for us to not return
+		// an error and let scraping continue. Log a message instead of
+		// returning a non-nil error so that processing of other metrics
+		// can go on. See Issue https://github.com/orijtech/promreceiver/issues/3
+		ca.logger.Log("error", "unknown recognized metric type", "type", metadataType)
+		return nil
 	}
 
 	node := nodeFromJobNameAddress(jobName, address, scheme)

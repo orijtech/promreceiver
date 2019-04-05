@@ -15,6 +15,7 @@
 package promreceiver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -26,6 +27,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	gokitLog "github.com/go-kit/kit/log"
 
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
@@ -104,6 +107,7 @@ func TestProcessNonHistogramLikeMetrics(t *testing.T) {
 		ref        uint64
 		value      float64
 		want       []*agentmetricspb.ExportMetricsServiceRequest
+		wantLog    string
 	}{
 		{
 			metricName: "call_counts",
@@ -162,10 +166,38 @@ func TestProcessNonHistogramLikeMetrics(t *testing.T) {
 				},
 			},
 		},
+		{
+			// We explicitly want no error for unsupported types. See Issue https://github.com/orijtech/promreceiver/issues/3.
+			metricName: "restarts",
+			labelsList: labels.Labels{
+				{Name: "method", Value: "go.redis.xadd"},
+				{Name: "status", Value: "ERROR"},
+			},
+			value:    77.3,
+			timeAtMs: 1549154046078,
+			metadata: &scrape.MetricMetadata{
+				Unit:   "1",
+				Help:   "The number of restarts",
+				Metric: "restarts",
+				Type:   textparse.MetricType("summary"),
+			},
+			want:    []*agentmetricspb.ExportMetricsServiceRequest{},
+			wantErr: "",
+			wantLog: `error="unknown recognized metric type" type=summary` + "\n",
+		},
 	}
 
 	for i, tt := range values {
+		logBuf := new(bytes.Buffer)
+		ca.logger = gokitLog.NewLogfmtLogger(logBuf)
+
 		err := ca.processNonHistogramLikeMetrics(tt.metricName, tt.metadata, tt.scheme, tt.labelsList, tt.ref, tt.timeAtMs, tt.value)
+		if tt.wantLog != "" {
+			if g, w := logBuf.String(), tt.wantLog; g != w {
+				t.Errorf("#%d: Log mismatch\nGot:\n\t%q\nWant:\n\t%q", i, g, w)
+			}
+		}
+
 		if tt.wantErr != "" {
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Errorf("#%d: unexpected error %v wanted %s", i, err, tt.wantErr)
